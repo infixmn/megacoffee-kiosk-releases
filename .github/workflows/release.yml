@@ -1,0 +1,513 @@
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.1)'
+        required: true
+
+env:
+  NODE_VERSION: '22'
+  CODE_REPO: infixmn/megacoffee-kiosk
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            make_cmd: make:mac
+          - os: windows-latest
+            platform: win32
+            make_cmd: make:win
+          - os: ubuntu-latest
+            platform: linux
+            make_cmd: make:linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Clone private code
+        run: |
+          git clone https://x-access-token:${{ secrets.CODE_REPO_TOKEN }}@github.com/${{ env.CODE_REPO }}.git .
+          git checkout v${{ github.event.client_payload.version || github.event.inputs.version }}
+        shell: bash
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: npm ci --ignore-scripts
+
+      - name: Install dependencies (Windows/macOS)
+        if: matrix.platform != 'linux'
+        run: npm ci
+
+      - name: Bundle xdelta3 binary (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          brew install xdelta
+          chmod +x scripts/bundle-xdelta3-mac.sh
+          ./scripts/bundle-xdelta3-mac.sh
+          echo "Bundled xdelta3 for macOS ARM64 with dependencies"
+          ls -lh resources/bin/
+          ls -lh resources/lib/
+
+      - name: Bundle xdelta3 binary (Windows)
+        if: matrix.platform == 'win32'
+        run: |
+          # Download xdelta3 for Windows
+          $url = "https://github.com/jmacd/xdelta-gpl/releases/download/v3.1.0/xdelta3-3.1.0-x86_64.exe.zip"
+          $zipPath = "$env:TEMP\xdelta3.zip"
+          $extractPath = "$env:TEMP\xdelta3"
+
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          New-Item -ItemType Directory -Force -Path "resources\bin"
+          Copy-Item "$extractPath\xdelta3-3.1.0-x86_64.exe" "resources\bin\xdelta3-win-x64.exe"
+
+          Write-Host "Bundled xdelta3 for Windows x64"
+          Get-ChildItem resources\bin
+        shell: pwsh
+
+      - name: Bundle xdelta3 binary (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xdelta3 patchelf
+          chmod +x scripts/bundle-xdelta3-linux.sh
+          ./scripts/bundle-xdelta3-linux.sh
+          echo "Bundled xdelta3 for Linux x64 with dependencies"
+          ls -lh resources/bin/
+          ls -lh resources/lib/
+
+      - name: Verify Squirrel vendor files (Windows)
+        if: matrix.platform == 'win32'
+        run: |
+          echo "Checking Squirrel vendor directory..."
+          $vendorPath = "node_modules\electron-winstaller\vendor"
+          if (Test-Path $vendorPath) {
+            Get-ChildItem $vendorPath -Recurse | Select-Object FullName
+          } else {
+            echo "WARNING: Vendor directory not found at $vendorPath"
+            echo "Listing electron-winstaller contents..."
+            Get-ChildItem "node_modules\electron-winstaller" -Recurse -Depth 2 | Select-Object FullName
+          }
+        shell: pwsh
+
+      - name: Rebuild native modules
+        run: |
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            npx electron-rebuild -f -o better-sqlite3
+          else
+            npm run rebuild:electron
+          fi
+        shell: bash
+
+      # macOS only: import signing certificate into temp keychain
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'darwin'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          security find-identity -p codesigning -v
+
+      - name: Verify signing secrets (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          echo "Checking macOS signing secrets..."
+          if [ -z "$APPLE_ID" ]; then echo "WARNING: APPLE_ID is not set"; else echo "APPLE_ID is set"; fi
+          if [ -z "$APPLE_PASSWORD" ]; then echo "WARNING: APPLE_PASSWORD is not set"; else echo "APPLE_PASSWORD is set"; fi
+          if [ -z "$APPLE_TEAM_ID" ]; then echo "WARNING: APPLE_TEAM_ID is not set"; else echo "APPLE_TEAM_ID is set"; fi
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Test notarytool credentials (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --limit 1 || echo "ERROR: notarytool credentials are invalid!"
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Build application
+        timeout-minutes: 30
+        run: |
+          # Set SOURCE_DATE_EPOCH for reproducible builds
+          export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH ($(date -u -d @$SOURCE_DATE_EPOCH 2>/dev/null || date -u -r $SOURCE_DATE_EPOCH))"
+          npm run ${{ matrix.make_cmd }}
+        shell: bash
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_WS_URL: ${{ vars.VITE_WS_URL }}
+          VITE_CLIENT_ID: ${{ vars.VITE_CLIENT_ID }}
+          VITE_CLIENT_SECRET: ${{ secrets.VITE_CLIENT_SECRET }}
+          ELECTRON_FORGE_SKIP_REBUILD: ${{ matrix.platform == 'linux' && 'true' || '' }}
+          VITE_UPDATE_URL: ${{ vars.VITE_UPDATE_URL }}
+          APPLE_SIGNING_ENABLED: ${{ matrix.platform == 'darwin' && 'true' || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SKIP_NOTARIZE: ${{ matrix.platform == 'darwin' && 'true' || '' }}
+          DEBUG: ${{ matrix.platform == 'darwin' && 'electron-osx-sign*' || '' }}
+
+      - name: Notarize macOS app
+        if: matrix.platform == 'darwin'
+        continue-on-error: true
+        timeout-minutes: 120
+        run: |
+          echo "Finding DMG for notarization..."
+          DMG_FILE=$(find ./out/make -name "*.dmg" -type f | head -1)
+          if [ -z "$DMG_FILE" ]; then
+            echo "WARNING: No DMG file found, skipping notarization"
+            exit 0
+          fi
+          echo "Found DMG: $DMG_FILE"
+          echo "File size: $(du -h "$DMG_FILE" | cut -f1)"
+
+          echo "Submitting DMG to Apple for notarization..."
+          SUBMIT_OUTPUT=$(xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --output-format json 2>&1) || true
+
+          echo "Submit output: $SUBMIT_OUTPUT"
+
+          SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+
+          if [ -z "$SUBMISSION_ID" ]; then
+            echo "WARNING: Failed to get submission ID, skipping notarization"
+            echo "$SUBMIT_OUTPUT"
+            exit 0
+          fi
+
+          echo "Submission ID: $SUBMISSION_ID"
+          echo "Waiting for notarization result (polling every 30s, up to 2 hours)..."
+
+          for i in $(seq 1 240); do
+            sleep 30
+            WAIT_OUTPUT=$(xcrun notarytool info "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --output-format json 2>&1) || true
+
+            STATUS=$(echo "$WAIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','In Progress'))" 2>/dev/null || echo "In Progress")
+            echo "[$((i*30))s] Status: $STATUS"
+
+            if [ "$STATUS" = "Accepted" ]; then
+              echo "Notarization accepted!"
+              echo "Stapling ticket to DMG..."
+              xcrun stapler staple "$DMG_FILE"
+              echo "DMG notarized and stapled successfully."
+              exit 0
+            elif [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+              echo "Notarization failed: $STATUS"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+              echo "WARNING: Notarization failed but continuing with release"
+              exit 0
+            fi
+          done
+
+          echo "WARNING: Notarization did not complete within 2 hours. Apple's service may be experiencing delays."
+          echo "The DMG is still code-signed and will work, but may show a Gatekeeper warning on first launch."
+          echo "You can notarize manually later with: xcrun notarytool submit MegaCoffee.dmg --apple-id ... --wait"
+          exit 0
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # macOS only: cleanup keychain
+      - name: Cleanup keychain
+        if: matrix.platform == 'darwin' && always()
+        run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}
+          path: |
+            out/make/**/*.dmg
+            out/make/**/*.zip
+            out/make/**/*.exe
+            out/make/**/*.deb
+            out/make/**/*.AppImage
+          retention-days: 5
+          include-hidden-files: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone private code (for scripts)
+        run: |
+          git clone https://x-access-token:${{ secrets.CODE_REPO_TOKEN }}@github.com/${{ env.CODE_REPO }}.git .
+          git checkout v${{ github.event.client_payload.version || github.event.inputs.version }}
+        shell: bash
+
+      - name: Install system dependencies (for native modules)
+        run: sudo apt-get update && sudo apt-get install -y python3 make g++ libudev-dev libusb-1.0-0-dev xdelta3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Organize and rename artifacts
+        run: |
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          mkdir -p ./release-files
+
+          # Naming convention: MegaCoffee-{version}-{platform}-{arch}.{ext}
+
+          # macOS DMG (arm64 from macos-14 runner)
+          DMG=$(find ./artifacts/build-darwin -name "*.dmg" -type f | head -1)
+          if [ -n "$DMG" ]; then
+            cp "$DMG" "./release-files/MegaCoffee-${VERSION}-mac-arm64.dmg"
+          fi
+
+          # macOS ZIP
+          MAC_ZIP=$(find ./artifacts/build-darwin -name "*.zip" -type f | head -1)
+          if [ -n "$MAC_ZIP" ]; then
+            cp "$MAC_ZIP" "./release-files/MegaCoffee-${VERSION}-mac-arm64.zip"
+          fi
+
+          # Windows EXE (Squirrel installer)
+          WIN_EXE=$(find ./artifacts/build-win32 -name "*.exe" -type f | head -1)
+          if [ -n "$WIN_EXE" ]; then
+            cp "$WIN_EXE" "./release-files/MegaCoffee-${VERSION}-win-x64.exe"
+          fi
+
+          # Windows ZIP (portable)
+          WIN_ZIP=$(find ./artifacts/build-win32 -name "*.zip" -type f | head -1)
+          if [ -n "$WIN_ZIP" ]; then
+            cp "$WIN_ZIP" "./release-files/MegaCoffee-${VERSION}-win-x64.zip"
+          fi
+
+          # Linux DEB
+          DEB=$(find ./artifacts/build-linux -name "*.deb" -type f | head -1)
+          if [ -n "$DEB" ]; then
+            cp "$DEB" "./release-files/MegaCoffee-${VERSION}-linux-x64.deb"
+          fi
+
+          # Linux AppImage
+          APPIMAGE=$(find ./artifacts/build-linux -name "*.AppImage" -type f | head -1)
+          if [ -n "$APPIMAGE" ]; then
+            cp "$APPIMAGE" "./release-files/MegaCoffee-${VERSION}-linux-x64.AppImage"
+          fi
+
+          # Linux ZIP
+          LINUX_ZIP=$(find ./artifacts/build-linux -name "*.zip" -type f | head -1)
+          if [ -n "$LINUX_ZIP" ]; then
+            cp "$LINUX_ZIP" "./release-files/MegaCoffee-${VERSION}-linux-x64.zip"
+          fi
+
+          echo "Release files:"
+          ls -la ./release-files/
+
+      - name: Generate update manifests
+        run: |
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          REPO="${{ github.repository }}"
+          mkdir -p ./update-files
+
+          # Get last 3 previous releases for delta patches
+          PREV_TAGS=""
+          PREV_TAGS=$(gh release list --repo "$REPO" --limit 10 --json tagName --jq '.[].tagName' | grep -v "v${VERSION}" | head -3) || true
+          echo "Previous releases for patching: $PREV_TAGS"
+
+          # Extract New Version artifacts for patching
+          echo "Extracting new version artifacts..."
+          mkdir -p ./new-extracted/darwin ./new-extracted/win32 ./new-extracted/linux
+          mkdir -p ./platform-artifacts/linux
+
+          # MacOS ZIP
+          MAC_ZIP=$(find ./artifacts/build-darwin -name "*.zip" -type f | head -1)
+          if [ -n "$MAC_ZIP" ]; then
+            unzip -qo "$MAC_ZIP" -d ./new-extracted/darwin/ || true
+          fi
+
+          # Windows ZIP (Portable)
+          WIN_ZIP=$(find ./artifacts/build-win32 -name "*.zip" -type f | head -1)
+          if [ -n "$WIN_ZIP" ]; then
+            unzip -qo "$WIN_ZIP" -d ./new-extracted/win32/ || true
+          fi
+
+          # Linux ZIP
+          LIN_ZIP=$(find ./artifacts/build-linux -name "*.zip" -type f | head -1)
+          if [ -n "$LIN_ZIP" ]; then
+            unzip -qo "$LIN_ZIP" -d ./new-extracted/linux/ || true
+          fi
+
+          # Linux AppImage (fallback for display)
+          find ./artifacts/build-linux -type f -name "*.AppImage" -exec cp {} ./platform-artifacts/linux/ \; 2>/dev/null || true
+
+          # Generate manifest for each platform
+          for PLATFORM in darwin win32 linux; do
+            # Define where to look for the "new" version
+            NEW_SOURCE="./new-extracted/$PLATFORM"
+
+            if ([ -d "$NEW_SOURCE" ] && [ "$(ls -A "$NEW_SOURCE" 2>/dev/null)" ]); then
+              echo ""
+              echo "=== Generating update for $PLATFORM ==="
+
+              # First run: generate full tar + manifest (no --old)
+              npx tsx scripts/generate-patch.ts \
+                --new "$NEW_SOURCE" \
+                --platform $PLATFORM \
+                --output ./update-files/$PLATFORM \
+                --flat-urls
+
+              # Then generate delta patches from each of the last 3 versions
+              if [ -n "$PREV_TAGS" ]; then
+                for PREV_TAG in $PREV_TAGS; do
+                  PREV_VER="${PREV_TAG#v}"
+                  # Match new naming: MegaCoffee-{version}-{platform}-{arch}.tar
+                  if [ "$PLATFORM" = "darwin" ]; then
+                    OLD_TAR="MegaCoffee-${PREV_VER}-mac-arm64.tar"
+                  elif [ "$PLATFORM" = "win32" ]; then
+                    OLD_TAR="MegaCoffee-${PREV_VER}-win-x64.tar"
+                  else
+                    OLD_TAR="MegaCoffee-${PREV_VER}-linux-x64.tar"
+                  fi
+                  mkdir -p ./old-artifacts/$PLATFORM/$PREV_TAG
+                  echo "Checking $PREV_TAG for $PLATFORM tar ($OLD_TAR)..."
+                  gh release download "$PREV_TAG" --repo "$REPO" --pattern "$OLD_TAR" --dir ./old-artifacts/$PLATFORM/$PREV_TAG 2>/dev/null || true
+
+                  if [ -f "./old-artifacts/$PLATFORM/$PREV_TAG/$OLD_TAR" ]; then
+                    echo "Found $OLD_TAR — generating delta patch from $PREV_TAG"
+                    mkdir -p ./old-extracted/$PLATFORM/$PREV_TAG
+                    # Try our custom DPA extractor first, fall back to standard tar if it's an old version
+                    npx tsx scripts/generate-patch.ts --extract "./old-artifacts/$PLATFORM/$PREV_TAG/$OLD_TAR" --to ./old-extracted/$PLATFORM/$PREV_TAG || \
+                    tar -xf "./old-artifacts/$PLATFORM/$PREV_TAG/$OLD_TAR" -C ./old-extracted/$PLATFORM/$PREV_TAG
+
+                    npx tsx scripts/generate-patch.ts \
+                      --new "$NEW_SOURCE" \
+                      --old ./old-extracted/$PLATFORM/$PREV_TAG \
+                      --platform $PLATFORM \
+                      --output ./update-files/$PLATFORM \
+                      --flat-urls
+                  else
+                    echo "No tar found for $PLATFORM in $PREV_TAG, skipping"
+                  fi
+                done
+              fi
+            fi
+          done
+
+          # Merge per-platform manifests into one latest.json
+          npx tsx scripts/merge-manifests.ts ./update-files
+
+          # Copy all update files to a flat directory for upload
+          mkdir -p ./update-upload
+          # Copy the merged latest.json
+          cp ./update-files/latest.json ./update-upload/ 2>/dev/null || true
+          # Copy all tar and patch files from platform subdirs
+          find ./update-files -name "*.tar" -exec cp {} ./update-upload/ \; 2>/dev/null || true
+          find ./update-files -name "*.patch" -exec cp {} ./update-upload/ \; 2>/dev/null || true
+
+          echo ""
+          echo "=== Update files to upload ==="
+          ls -la ./update-upload/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        run: |
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          TAG="v$VERSION"
+
+          # Combine release files + update files
+          mkdir -p ./all-release-files
+          cp ./release-files/* ./all-release-files/ 2>/dev/null || true
+          cp ./update-upload/* ./all-release-files/ 2>/dev/null || true
+
+          # Copy Windows .exe from update-files (generated by generate-patch.ts)
+          find ./update-files -name "*.exe" -exec cp {} ./all-release-files/ \; 2>/dev/null || true
+
+          echo "All release files:"
+          ls -la ./all-release-files/
+
+          gh release create "$TAG" ./all-release-files/* \
+            --title "v$VERSION" \
+            --notes "Release v$VERSION" \
+            --repo ${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify all kiosk clients via API
+        continue-on-error: true
+        run: |
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "Broadcasting update v$VERSION to all kiosk clients..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ vars.VITE_API_URL }}/api/app_updates/broadcast" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.API_DEPLOY_TOKEN }}" \
+            -d "{\"version\":\"$VERSION\"}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            echo "All kiosk clients notified of v$VERSION"
+          else
+            echo "WARNING: Failed to notify kiosk clients (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            echo "Kiosk clients will still pick up the update via hourly polling"
+          fi
