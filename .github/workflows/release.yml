@@ -99,6 +99,11 @@ jobs:
       contents: write
 
     steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xdelta3 p7zip-full
+
       - name: Clone private code (for scripts)
         run: |
           git clone https://x-access-token:${{ secrets.CODE_REPO_TOKEN }}@github.com/${{ env.CODE_REPO }}.git .
