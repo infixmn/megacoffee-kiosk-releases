@@ -152,7 +152,7 @@ jobs:
 
           # Get last 3 previous releases for delta patches
           PREV_TAGS=""
-          PREV_TAGS=$(gh release list --repo "$REPO" --limit 10 --json tagName --jq '.[].tagName' | grep -v "v${VERSION}" | head -3) || true
+          PREV_TAGS=$(gh release list --repo "$REPO" --limit 10 --json tagName --jq '.[].tagName' | grep -v "v$VERSION" | head -3) || true
           echo "Previous releases for patching: $PREV_TAGS"
 
           # Extract New Version artifacts for patching
