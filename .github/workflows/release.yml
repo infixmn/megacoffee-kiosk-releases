@@ -79,6 +79,7 @@ jobs:
           VITE_CLIENT_ID: ${{ vars.VITE_CLIENT_ID }}
           VITE_CLIENT_SECRET: ${{ secrets.VITE_CLIENT_SECRET }}
           VITE_UPDATE_URL: ${{ vars.VITE_UPDATE_URL }}
+          VITE_QPAY_API_URL: ${{ vars.VITE_QPAY_API_URL }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
