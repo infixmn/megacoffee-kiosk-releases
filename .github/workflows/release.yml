@@ -63,7 +63,9 @@ jobs:
           }
 
       - name: Rebuild native modules
-        run: npm run rebuild:electron
+        run: |
+          npm config set msvs_version 2022
+          npm run rebuild:electron
 
       - name: Build application
         timeout-minutes: 30
