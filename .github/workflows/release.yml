@@ -68,6 +68,20 @@ jobs:
       - name: Rebuild native modules
         run: npm run rebuild:electron
 
+      - name: Fix Squirrel 7zip binary
+        shell: pwsh
+        run: |
+          $vendorDir = "node_modules\electron-winstaller\vendor"
+          $vendor7z = Join-Path $vendorDir "7z.exe"
+          $system7z = "C:\Program Files\7-Zip\7z.exe"
+
+          if (Test-Path $system7z) {
+            Copy-Item $system7z $vendor7z -Force
+            Write-Host "Replaced vendor 7z.exe with system 7z.exe"
+          } else {
+            Write-Host "WARNING: System 7z.exe not found at $system7z"
+          }
+
       - name: Build application
         timeout-minutes: 30
         run: |
